@@ -12,8 +12,18 @@ object TimeUsage extends TimeUsageInterface:
 
   // Reduce Spark logging verbosity
   Logger.getLogger("org.apache.spark").setLevel(Level.ERROR)
+  // Set the 'hadoop.home.dir' system property for Windows to locate the necessary Hadoop binaries
   if isWin then System.setProperty("hadoop.home.dir", System.getProperty("user.dir") + "\\winutils\\hadoop-3.3.1")
 
+  /**
+   * Initialize the SparkSession for time usage analysis
+   * SparkSession is the unified entry point and programming interface introduced in Spark 2.0.
+   * It encapsulates the functionality of SparkContext along with additional features and simplifications.
+   * SparkSession provides a higher-level API that supports working with structured and semi-structured data
+   * through DataFrames and Datasets.
+   * It offers built-in support for Spark SQL, DataFrame operations, Dataset APIs,
+   * and DataFrame-based machine learning libraries.
+   */
   val spark: SparkSession =
     SparkSession
       .builder()
@@ -30,6 +40,13 @@ object TimeUsage extends TimeUsageInterface:
     timeUsageByLifePeriod()
     spark.close()
 
+  /**
+   * Compute time usage statistics by life period.
+   *
+   * This method reads the input data frame from the "atussum.csv" file and computes time usage statistics
+   * by partitioning the columns into primary needs, work, and other activities. It then summarizes the time usage
+   * and groups the results. The final data frame is displayed.
+   */
   def timeUsageByLifePeriod(): Unit =
     val (columns, initDf) = read("src/main/resources/timeusage/atussum.csv")
     val (primaryNeedsColumns, workColumns, otherColumns) = classifiedColumns(columns)
@@ -37,19 +54,30 @@ object TimeUsage extends TimeUsageInterface:
     val finalDf = timeUsageGrouped(summaryDf)
     finalDf.show()
 
-  /** @return The read DataFrame along with its column names. */
+  /**
+   * Reads a DataFrame from the specified path and returns it along with its column names.
+   *
+   * @param path The path to the CSV file.
+   * @return The read DataFrame along with its column names.
+   */
   def read(path: String): (List[String], DataFrame) =
     val df = spark.read.options(Map("header" -> "true", "inferSchema" -> "true")).csv(path)
     (df.schema.fields.map(_.name).toList, df)
 
-  /** @return An RDD Row compatible with the schema produced by `dfSchema`
-    * @param line Raw fields
-    */
+  /**
+   * Converts a list of raw fields into an RDD Row compatible with the schema produced by `dfSchema`.
+   * The first column is a String, whereas the remaining columns have type Double.
+   *
+   * @return An RDD Row compatible with the schema produced by `dfSchema`
+   * @param line Raw fields
+   */
   def row(line: List[String]): Row =
-    ???
+    Row.fromSeq(line.head :: line.tail.map(_.toDouble))
 
   /** @return The initial data frame columns partitioned in three groups: primary needs (sleeping, eating, etc.),
     *         work and other (leisure activities)
+    *
+    * @param columnNames The list of column names.
     *
     * @see https://www.kaggle.com/bls/american-time-use-survey
     *
@@ -64,7 +92,21 @@ object TimeUsage extends TimeUsageInterface:
     *    “t10”, “t12”, “t13”, “t14”, “t15”, “t16” and “t18” (those which are not part of the previous groups only).
     */
   def classifiedColumns(columnNames: List[String]): (List[Column], List[Column], List[Column]) =
-    ???
+    val primaryNeedsPrefix = List("t01", "t03", "t11", "t1801", "t1803")
+    val workPrefixes = List("t05", "t1805")
+    val otherPrefixes = List("t02", "t04", "t06", "t07", "t08", "t09", "t10", "t12", "t13", "t14", "t15", "t16", "t18")
+
+    columnNames.foldLeft((List.empty[Column], List.empty[Column], List.empty[Column])) {
+      case ((primary, work, other), name) =>
+        if primaryNeedsPrefix.exists(prefix => name.startsWith(prefix)) then
+          (col(name) :: primary, work, other)
+        else if workPrefixes.exists(prefix => name.startsWith(prefix)) then
+          (primary, col(name) :: work, other)
+        else if otherPrefixes.exists(prefix => name.startsWith(prefix)) then
+          (primary, work, col(name) :: other)
+        else
+          (primary, work, other)
+    }
 
   /** @return a projection of the initial DataFrame such that all columns containing hours spent on primary needs
     *         are summed together in a single column (and same for work and leisure). The “teage” column is also
@@ -106,17 +148,32 @@ object TimeUsage extends TimeUsageInterface:
     // more sense for our use case
     // Hint: you can use the `when` and `otherwise` Spark functions
     // Hint: don’t forget to give your columns the expected name with the `as` method
-    val workingStatusProjection: Column = ???
-    val sexProjection: Column = ???
-    val ageProjection: Column = ???
+    val workingStatusProjection = when(
+      condition = df("telfs") >= 1 && df("telfs") < 3,
+      value = "working"
+    ).otherwise("not working").as(alias = "working")
+
+    val sexProjection = when(
+      condition = df("tesex") === 1,
+      value = "male"
+    ).otherwise("female").as("sex")
+
+    val ageProjection = when(
+      condition = df("teage").between(15, 22),
+      value = "young"
+    ).when(
+      condition = df("teage").between(23, 55),
+      value = "active"
+    ).otherwise("elder").as("age")
 
     // Create columns that sum columns of the initial dataset
     // Hint: you want to create a complex column expression that sums other columns
     //       by using the `+` operator between them
     // Hint: don’t forget to convert the value to hours
-    val primaryNeedsProjection: Column = ???
-    val workProjection: Column = ???
-    val otherProjection: Column = ???
+    val primaryNeedsProjection = primaryNeedsColumns.reduce(_ + _).divide(60).as("primaryNeeds")
+    val workProjection = workColumns.reduce(_ + _).divide(60).as("work")
+    val otherProjection = otherColumns.reduce(_ + _).divide(60).as("other")
+
     df
       .select(workingStatusProjection, sexProjection, ageProjection, primaryNeedsProjection, workProjection, otherProjection)
       .where($"telfs" <= 4) // Discard people who are not in labor force
@@ -139,7 +196,14 @@ object TimeUsage extends TimeUsageInterface:
     * Finally, the resulting DataFrame should be sorted by working status, sex and age.
     */
   def timeUsageGrouped(summed: DataFrame): DataFrame =
-    ???
+    summed
+      .groupBy($"working", $"sex", $"age")
+      .agg(
+        round(avg($"primaryNeeds"), 1).as("primaryNeeds"),
+        round(avg($"work"), 1).as("work"),
+        round(avg($"other"), 1).as("other")
+      )
+      .sort($"working", $"sex", $"age")
 
   /**
     * @return Same as `timeUsageGrouped`, but using a plain SQL query instead
@@ -154,7 +218,11 @@ object TimeUsage extends TimeUsageInterface:
     * @param viewName Name of the SQL view to use
     */
   def timeUsageGroupedSqlQuery(viewName: String): String =
-    ???
+    "SELECT working, sex, age, ROUND(AVG(primaryNeeds), 1) as primaryNeeds," +
+      " ROUND(AVG(work), 1) as work, ROUND(AVG(other), 1) as other " +
+      s"FROM $viewName " +
+      "GROUP BY working, sex, age " +
+      "ORDER BY working, sex, age"
 
   /**
     * @return A `Dataset[TimeUsageRow]` from the “untyped” `DataFrame`
@@ -164,7 +232,16 @@ object TimeUsage extends TimeUsageInterface:
     * cast them at the same time.
     */
   def timeUsageSummaryTyped(timeUsageSummaryDf: DataFrame): Dataset[TimeUsageRow] =
-    ???
+    timeUsageSummaryDf.map(row =>
+      TimeUsageRow(
+        row.getAs("working"),
+        row.getAs("sex"),
+        row.getAs("age"),
+        row.getAs("primaryNeeds"),
+        row.getAs("work"),
+        row.getAs("other")
+      )
+    )
 
   /**
     * @return Same as `timeUsageGrouped`, but using the typed API when possible
@@ -178,7 +255,18 @@ object TimeUsage extends TimeUsageInterface:
     * Hint: you should use the `groupByKey` and `avg` methods.
     */
   def timeUsageGroupedTyped(summed: Dataset[TimeUsageRow]): Dataset[TimeUsageRow] =
-    ???
+    summed
+      .groupByKey(row => (row.working, row.sex, row.age))
+      .agg(
+        round(avg($"primaryNeeds"), 1).as(Encoders.DOUBLE),
+        round(avg($"work"), 1).as(Encoders.DOUBLE),
+        round(avg($"other"), 1).as(Encoders.DOUBLE)
+      )
+      .map {
+        case ((working, sex, age), primaryNeeds, work, other) =>
+          TimeUsageRow(working, sex, age, primaryNeeds, work, other)
+      }
+      .sort($"working", $"sex", $"age")
 
 /**
   * Models a row of the summarized data set
